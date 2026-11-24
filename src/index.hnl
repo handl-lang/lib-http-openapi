@@ -1,0 +1,715 @@
+--- http-openapi -- pure-handl OpenAPI 3.0.x spec generator over
+--- lib-route route entries (P-008 / T-143).
+---
+--- Two entry points:
+---
+---   openapi(routes, opts?)        -- `routes` is the nested
+---                                   `{ name: leaf | subtree }` route
+---                                   map consumed by http-router;
+---                                   flattened via
+---                                   `route.route_map(routes, opts)`
+---                                   into normalized entries.
+---   openapi_entries(entries, opts?) -- `entries` is a flat list of
+---                                   `{ path, method | methods,
+---                                   handler?, name?, doc?,
+---                                   constraints? }` records (handler
+---                                   is accepted but unused -- this
+---                                   module only reads routing
+---                                   metadata).
+---
+--- Both return a plain handl record shaped like an OpenAPI 3.0.x
+--- document -- `{ openapi: "3.0.3", info: {...}, paths: {...},
+--- servers?, components? }` -- JSON-serializable via the `json`
+--- library (no YAML emitter).
+---
+--- Pattern bridging (lib-route path grammar -> OpenAPI):
+---   - `:param`            -> `{param}` path template + auto
+---                            `in: path, required: true` parameter
+---   - `:file.:ext` mixed  -> `{file}.{ext}` (suffix/prefix vars
+---                            inside a segment join with their
+---                            literals)
+---   - `*name` splat       -> `{name}` + `x-handl-pattern` vendor
+---                            extension carrying the original
+---                            pattern (a splat matches many
+---                            segments; a path param matches one)
+---   - bare `*` splat      -> literal `*` segment + `x-handl-pattern`
+---   - `(/optional)`       -> enumerated expansions (each expanded
+---     groups                  path gets the same operation);
+---                            present-branch-before-absent,
+---                            capped at 16 expansions per pattern --
+---                            beyond the cap the base pattern
+---                            (groups omitted) is emitted with
+---                            `x-handl-pattern`
+---   - `?k=v` / bare `?k`  -> required `in: query` parameters;
+---                            `k=v` adds `schema.enum: [v]`
+---   - entry `constraints` -> same query-parameter treatment
+---     (`{k, v}` pairs; `v == ""`/`null` = bare presence check)
+---   - method `"*"`        -> `x-handl-methods` vendor extension,
+---                            or expanded into concrete verbs when
+---                            `opts.methods` is a non-empty list
+---
+--- `doc` passthrough: `summary`, `description`, `tags`,
+--- `operationId`, `deprecated`, `params`, `requestBody`,
+--- `responses`, `security` are copied verbatim (unknown keys
+--- ignored). Generated path/query parameters merge with
+--- `doc.params`: on a `(name, in)` clash the pattern-derived
+--- parameter wins. `operationId` = `doc.operationId` ||
+--- `entry.name` || generated (`<method>_<sanitized-path>`); all
+--- collisions get `_2`, `_3`, ... suffixes in encounter order.
+---
+--- `opts` (all optional):
+---   info        -- record merged over `{ title: "API",
+---                  version: "0.0.0" }` (right-wins per key)
+---   servers     -- passed through to the top-level `servers`
+---   components  -- passed through to the top-level `components`
+---   methods     -- verb list: expands `"*"` methods AND is handed
+---                  to `route_map` as the recognized method-map
+---                  keys (openapi/1 only; default = the 7 standard
+---                  HTTP verbs for map recognition, wildcard left
+---                  unexpanded)
+---   sep, leaf_keys, spec_keys -- forwarded to `route_map`
+---                  (openapi/1 only)
+---
+--- Exports:
+---   openapi(routes, opts?)         ~> OpenAPI doc record
+---   openapi_entries(entries, opts?) ~> OpenAPI doc record
+
+from "str" import * as str
+from "char" import * as char
+from "route" import * as rt
+
+-- ---------------------------------------------------------------------
+-- list / record helpers (same idioms as lib-route)
+-- ---------------------------------------------------------------------
+
+alen := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [_h, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+lmap := (f, xs) ~> while { xs: xs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t, out: [...out, f(h)] } }
+  }
+}
+
+lfilter := (p, xs) ~> while { xs: xs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t,
+      out: if p(h) { [...out, h] } else { out } } }
+  }
+}
+
+--- append every element of `bs` onto `a`, preserving order.
+cat := (a, bs) ~> while { xs: bs, out: a } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t, out: [...out, h] } }
+  }
+}
+
+mem := (x, xs) ~> while { xs: xs, found: false } {
+  (xs, found) ~> match xs {
+    []: { out: found },
+    [h, ...t]: if h == x {
+      { out: true }
+    } else {
+      { state: { xs: t, found: found } }
+    }
+  }
+}
+
+is_arr := (v) ~> type.of(v) == "array"
+is_obj := (v) ~> type.of(v) == "object"
+is_str := (v) ~> type.of(v) == "string"
+
+rest0 := (rest) ~> match rest {
+  [h, ..._t]: h,
+  []: null
+}
+
+--- `xs` with duplicates removed, first occurrence wins.
+uniq := (xs) ~> while { xs: xs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t,
+      out: if mem(h, out) { out } else { [...out, h] } } }
+  }
+}
+
+--- cartesian product of two lists of item-lists: every `a ++ b`
+--- pair, `a` outer / `b` inner.
+pairs := (xxs, yys) ~> while { xs: xxs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t,
+      out: cat(out, lmap((b) ~> cat(h, b), yys)) } }
+  }
+}
+
+--- flatten a list of lists by one level.
+cat_all := (xss) ~> while { xs: xss, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t, out: cat(out, h) } }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- entry normalization
+-- ---------------------------------------------------------------------
+
+STD_METHODS := ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD",
+  "OPTIONS"]
+
+--- `method`/`methods` (string or list of strings) -> list of
+--- uppercased method names; absent -> ["*"].
+norm_methods := (e) ~> do {
+  norm := (mv) ~> if is_str(mv) {
+    [str.upper(mv)]
+  } else {
+    if is_arr(mv) {
+      lmap((m) ~> if is_str(m) {
+        str.upper(m)
+      } else {
+        error.raise("http-openapi: method names must be strings")
+      }, mv)
+    } else {
+      error.raise("http-openapi: 'method'/'methods' must be a " +
+        "string or list")
+    }
+  }
+  if hash_map.has(e, "methods") {
+    norm(hash_map.get_or(e, "methods", []))
+  } else {
+    if hash_map.has(e, "method") {
+      norm(hash_map.get_or(e, "method", "*"))
+    } else {
+      ["*"]
+    }
+  }
+}
+
+norm_pair := (p) ~> if is_obj(p) {
+  { k: hash_map.get_or(p, "k",
+      hash_map.get_or(p, "key", null)),
+    v: hash_map.get_or(p, "v",
+      hash_map.get_or(p, "value", null)) }
+} else {
+  if is_arr(p) && alen(p) == 2 {
+    { k: p[0], v: p[1] }
+  } else {
+    error.raise("http-openapi: 'constraints' entries must be " +
+      "{k,v} pairs")
+  }
+}
+
+--- `constraints` spec (record `{k: v}` or list of pairs) -> list of
+--- `{k, v}`; null/absent -> [].
+norm_cons := (v) ~> if v == null {
+  []
+} else {
+  if is_obj(v) {
+    lmap((k) ~> { k: k, v: hash_map.get_or(v, k, null) },
+      hash_map.keys(v))
+  } else {
+    if is_arr(v) {
+      lmap(norm_pair, v)
+    } else {
+      error.raise("http-openapi: 'constraints' must be a record " +
+        "or list of pairs")
+    }
+  }
+}
+
+--- raw entry / route_map entry -> uniform
+--- `{ name, methods, path, doc, cons }`.
+norm_entry := (e) ~> do {
+  if is_obj(e) == false {
+    error.raise("http-openapi: entries must be records")
+  } else {
+    do {
+      path_raw := hash_map.get_or(e, "path",
+        hash_map.get_or(e, "pattern", null))
+      if is_str(path_raw) == false {
+        error.raise("http-openapi: entry requires a 'path' " +
+          "string")
+      } else {
+        do {
+          p := if str.starts_with(path_raw, "/") {
+            path_raw
+          } else {
+            "/" + path_raw
+          }
+          { name: hash_map.get_or(e, "name", null),
+            methods: norm_methods(e),
+            path: p,
+            doc: hash_map.get_or(e, "doc", null),
+            cons: norm_cons(hash_map.get_or(e, "constraints",
+              null)) }
+        }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- pattern -> OpenAPI path bridging
+-- ---------------------------------------------------------------------
+
+--- number of item-list expansions `items` produces (each optional
+--- group doubles its contents' variants plus the absent branch).
+count_exps := (self, items) ~> while { xs: items, acc: 1 } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [h, ...t]: { state: { xs: t, acc: acc * (if h.k == "group" {
+      1 + self(self, h.items)
+    } else {
+      1
+    }) } }
+  }
+}
+
+EXP_CAP := 16
+
+--- expand `items` into every concrete item-list: groups contribute
+--- their (recursively expanded) contents before the absent branch.
+exp_list := (self, items) ~> do {
+  if alen(items) == 0 {
+    [[]]
+  } else {
+    do {
+      h := items[0]
+      t := match items {
+        [_hd, ...tt]: tt,
+        []: []
+      }
+      hs := if h.k == "group" {
+        cat(self(self, h.items), [[]])
+      } else {
+        [[h]]
+      }
+      pairs(hs, self(self, t))
+    }
+  }
+}
+
+--- `items` with every optional group dropped (the "base" pattern
+--- used when expansions exceed EXP_CAP).
+strip_groups := (items) ~> lfilter((it) ~> it.k != "group", items)
+
+--- deep search: any splat item (possibly inside a group)?
+has_splat := (self, items) ~> while { xs: items, found: false } {
+  (xs, found) ~> match xs {
+    []: { out: found },
+    [h, ...t]: { state: { xs: t, found: found ||
+      h.k == "splat" ||
+      (h.k == "group" && self(self, h.items)) } }
+  }
+}
+
+--- one `seg` item's parts -> `{ text, pnames }` (`:name` ->
+--- `{name}` + recorded param name; literals verbatim).
+render_parts := (parts) ~> while { xs: parts, txt: "", ns: [] } {
+  (xs, txt, ns) ~> match xs {
+    []: { out: { text: txt, pnames: ns } },
+    [p, ...t]: if p.t == "lit" {
+      { state: { xs: t, txt: txt + p.s, ns: ns } }
+    } else {
+      { state: { xs: t,
+        txt: txt + "{" + p.name + "}",
+        ns: if mem(p.name, ns) { ns } else { [...ns, p.name] } } }
+    }
+  }
+}
+
+--- concrete item-list -> `{ path, pnames }`: segment texts joined
+--- with "/" (a leading empty `seg` already encodes the pattern's
+--- leading "/"; one is added when missing). `*name` -> `{name}`
+--- (param recorded), bare `*` -> literal `*` (binds nothing).
+render_items := (items) ~> while { xs: items, segs: [], ns: [] } {
+  (xs, segs, ns) ~> match xs {
+    []: do {
+      j := str.join(segs, "/")
+      p := if str.is_empty(j) {
+        "/"
+      } else {
+        if str.starts_with(j, "/") { j } else { "/" + j }
+      }
+      { out: { path: p, pnames: uniq(ns) } }
+    },
+    [it, ...t]: if it.k == "seg" {
+      do {
+        r := render_parts(it.parts)
+        { state: { xs: t, segs: [...segs, r.text],
+                   ns: cat(ns, r.pnames) } }
+      }
+    } else {
+      if it.k == "splat" {
+        do {
+          nm := it.name
+          txt := if nm == null { "*" } else { "{" + nm + "}" }
+          ns2 := if nm == null {
+            ns
+          } else {
+            if mem(nm, ns) { ns } else { [...ns, nm] }
+          }
+          { state: { xs: t, segs: [...segs, txt], ns: ns2 } }
+        }
+      } else {
+        { state: { xs: t, segs: segs, ns: ns } }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- parameters
+-- ---------------------------------------------------------------------
+
+--- `{name}` path templates -> OpenAPI path parameter records.
+path_params := (pnames) ~> lmap((n) ~> {
+  name: n, in: "path", required: true,
+  schema: { type: "string" } }, pnames)
+
+--- `{k, v}` constraint pairs -> required query parameters; `v`
+--- non-empty adds `schema.enum: [v]` (bare `?k`/`v == ""`/`null`
+--- is a presence check). First occurrence of a key wins.
+query_params := (cons) ~> while { xs: cons, out: [], seen: [] } {
+  (xs, out, seen) ~> match xs {
+    []: { out: out },
+    [c, ...t]: if c.k == null || mem(c.k, seen) {
+      { state: { xs: t, out: out, seen: seen } }
+    } else {
+      do {
+        v := c.v
+        sch := if v == "" || v == null {
+          { type: "string" }
+        } else {
+          if is_str(v) {
+            { type: "string", enum: [v] }
+          } else {
+            { enum: [v] }
+          }
+        }
+        { state: { xs: t,
+          out: [...out, { name: c.k, in: "query", required: true,
+                          schema: sch }],
+          seen: [...seen, c.k] } }
+      }
+    }
+  }
+}
+
+--- `doc.params` normalized to a list (array verbatim, single
+--- record wrapped, anything else -> []).
+doc_params := (doc) ~> do {
+  pv := hash_map.get_or(doc, "params", null)
+  if pv == null {
+    []
+  } else {
+    if is_arr(pv) {
+      pv
+    } else {
+      if is_obj(pv) { [pv] } else { [] }
+    }
+  }
+}
+
+--- does generated param `g` clash with doc param `p` on
+--- `(name, in)`?
+param_clash := (p, gen) ~> while { xs: gen, found: false } {
+  (xs, found) ~> match xs {
+    []: { out: found },
+    [g, ...t]: if is_obj(p) {
+      if g.name == hash_map.get_or(p, "name", null) &&
+          g.in == hash_map.get_or(p, "in", null) {
+        { out: true }
+      } else {
+        { state: { xs: t, found: found } }
+      }
+    } else {
+      { state: { xs: t, found: found } }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- operation assembly
+-- ---------------------------------------------------------------------
+
+DOC_KEYS := ["summary", "description", "tags", "operationId",
+  "deprecated", "params", "requestBody", "responses", "security"]
+
+--- strip trailing '_' from a sanitized operationId fragment.
+rtrim_u := (s) ~> while { s: s, i: 0 } {
+  (s, i) ~> if str.is_empty(s) {
+    { out: s }
+  } else {
+    do {
+      l := str.length(s)
+      if str.char_at(s, l - 1) == "_" {
+        { state: { s: str.slice(s, 0, l - 1), i: i } }
+      } else {
+        { out: s }
+      }
+    }
+  }
+}
+
+--- generated operationId base: `<method>_<sanitized-path>`
+--- (`*` -> `any`); keeps [a-z0-9_], collapses other runs to `_`.
+gen_base := (m, path_str) ~> do {
+  prefix := if m == "*" { "any" } else { str.lower(m) }
+  lp := str.lower(path_str)
+  san0 := while { i: 0, n: str.length(lp), out: "" } {
+    (i, n, out) ~> if i >= n {
+      { out: out }
+    } else {
+      do {
+        cp := char.code_point_at(lp, i)
+        ok := (cp >= 97 && cp <= 122) || (cp >= 48 && cp <= 57) ||
+          cp == 95
+        last := if str.is_empty(out) {
+          ""
+        } else {
+          str.char_at(out, str.length(out) - 1)
+        }
+        nc := if ok {
+          out + str.char_at(lp, i)
+        } else {
+          if last == "_" || str.is_empty(out) {
+            out
+          } else {
+            out + "_"
+          }
+        }
+        { state: { i: i + 1, n: n, out: nc } }
+      }
+    }
+  }
+  san := rtrim_u(san0)
+  if str.is_empty(san) {
+    prefix
+  } else {
+    prefix + "_" + san
+  }
+}
+
+--- first free id: `base`, `base_2`, `base_3`, ...
+uniq_id := (base, ids) ~> while { c: base, n: 2 } {
+  (c, n) ~> if mem(c, ids) {
+    { state: { c: base + "_" + type.to_string(n), n: n + 1 } }
+  } else {
+    { out: c }
+  }
+}
+
+nonempty_str := (v) ~> if is_str(v) {
+  str.length(v) > 0
+} else {
+  false
+}
+
+--- build one OpenAPI operation for entry `e` (normalized) on
+--- concrete path `cb` ({ path, mkey, m, pnames }); `genq` is the
+--- entry's generated query-parameter list; `ids` the used
+--- operationIds. Pattern-derived params win `(name, in)` clashes
+--- against `doc.params`.
+make_op := (e, cb, genq, ids) ~> do {
+  doc := if is_obj(e.doc) { e.doc } else { {} }
+  op0 := while { xs: DOC_KEYS, out: {} } {
+    (xs, out) ~> match xs {
+      []: { out: out },
+      [k, ...t]: { state: { xs: t, out: if hash_map.has(doc, k) {
+        hash_map.set(out, k, hash_map.get_or(doc, k, null))
+      } else {
+        out
+      } } }
+    }
+  }
+  gen := cat(path_params(cb.pnames), genq)
+  kept := lfilter((p) ~> param_clash(p, gen) == false,
+    doc_params(doc))
+  fp := cat(kept, gen)
+  op1 := if alen(fp) > 0 {
+    hash_map.set(op0, "params", fp)
+  } else {
+    op0
+  }
+  op2 := if e.xpat != null {
+    hash_map.set(op1, "x-handl-pattern", e.xpat)
+  } else {
+    op1
+  }
+  op3 := if cb.m == "*" {
+    hash_map.set(op2, "x-handl-methods", ["*"])
+  } else {
+    op2
+  }
+  bid := if nonempty_str(hash_map.get_or(doc, "operationId",
+      null)) {
+    hash_map.get_or(doc, "operationId", null)
+  } else {
+    if nonempty_str(e.name) {
+      e.name
+    } else {
+      gen_base(cb.m, cb.path)
+    }
+  }
+  oid := uniq_id(bid, ids)
+  hash_map.set(op3, "operationId", oid)
+}
+
+-- ---------------------------------------------------------------------
+-- entry -> path-item contributions
+-- ---------------------------------------------------------------------
+
+--- `"*"` expands into `opts.methods` verbs when that is a non-empty
+--- list; otherwise the wildcard is kept (and marked via
+--- `x-handl-methods` on the operation).
+resolve_methods := (meths, o) ~> do {
+  om := hash_map.get_or(o, "methods", null)
+  if is_arr(om) {
+    if alen(om) > 0 {
+      ex := lmap((m) ~> if is_str(m) { str.upper(m) } else { m },
+        om)
+      while { xs: meths, out: [] } {
+        (xs, out) ~> match xs {
+          []: { out: out },
+          [h, ...t]: { state: { xs: t,
+            out: if h == "*" { cat(out, ex) } else { [...out, h] } } }
+        }
+      }
+    } else {
+      meths
+    }
+  } else {
+    meths
+  }
+}
+
+--- fold one normalized entry into `{ paths, ids }`: every expanded
+--- path x resolved method becomes one operation.
+entry_paths := (e, o, st) ~> do {
+  comp := rt.compile_pat(e.path)
+  cons_all := cat(comp.constraints, e.cons)
+  n := count_exps(count_exps, comp.items)
+  overflow := n > EXP_CAP
+  exps := if overflow {
+    [strip_groups(comp.items)]
+  } else {
+    exp_list(exp_list, comp.items)
+  }
+  xpat := if has_splat(has_splat, comp.items) || overflow {
+    e.path
+  } else {
+    null
+  }
+  ee := { name: e.name, methods: e.methods, path: e.path,
+         doc: e.doc, cons: e.cons, xpat: xpat }
+  rexps := lmap((items) ~> render_items(items), exps)
+  meths := resolve_methods(e.methods, o)
+  combos := cat_all(lmap((r) ~> lmap((m) ~> {
+    path: r.path, mkey: str.lower(m), m: m, pnames: r.pnames
+  }, meths), rexps))
+  genq := query_params(cons_all)
+  while { ys: combos, paths: st.paths, ids: st.ids } {
+    (ys, paths, ids) ~> match ys {
+      []: { out: { paths: paths, ids: ids } },
+      [cb, ...yt]: do {
+        opr := make_op(ee, cb, genq, ids)
+        cur := hash_map.get_or(paths, cb.path, {})
+        paths2 := hash_map.set(paths, cb.path,
+          hash_map.set(cur, cb.mkey, opr))
+        { state: { ys: yt, paths: paths2,
+                   ids: [...ids, opr.operationId] } }
+      }
+    }
+  }
+}
+
+--- fold normalized entries into `{ paths, ids }`.
+build_paths := (entries, o) ~> while { xs: entries,
+    paths: {}, ids: [] } {
+  (xs, paths, ids) ~> match xs {
+    []: { out: { paths: paths, ids: ids } },
+    [e, ...t]: do {
+      r := entry_paths(e, o, { paths: paths, ids: ids })
+      { state: { xs: t, paths: r.paths, ids: r.ids } }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- document assembly + exports
+-- ---------------------------------------------------------------------
+
+build_doc := (entries, o) ~> do {
+  ne := lmap(norm_entry, entries)
+  r := build_paths(ne, o)
+  info_d := { title: "API", version: "0.0.0" }
+  oi := hash_map.get_or(o, "info", {})
+  info := if is_obj(oi) {
+    hash_map.merge(info_d, oi)
+  } else {
+    info_d
+  }
+  doc := { openapi: "3.0.3", info: info, paths: r.paths }
+  sv := hash_map.get_or(o, "servers", null)
+  doc2 := if sv != null {
+    hash_map.set(doc, "servers", sv)
+  } else {
+    doc
+  }
+  cp := hash_map.get_or(o, "components", null)
+  if cp != null {
+    hash_map.set(doc2, "components", cp)
+  } else {
+    doc2
+  }
+}
+
+opts_of := (rest) ~> if alen(rest) == 0 {
+  {}
+} else {
+  rest0(rest)
+}
+
+check_opts := (o) ~> if is_obj(o) == false {
+  error.raise("http-openapi: opts must be a record")
+} else {
+  o
+}
+
+--- OpenAPI 3.0.x document for a nested route map (same shape
+--- http-router consumes); flattened via `route.route_map`.
+export openapi := (routes, ...rest) ~> do {
+  o := check_opts(opts_of(rest))
+  ro := { sep: hash_map.get_or(o, "sep", "/"),
+    leaf_keys: hash_map.get_or(o, "leaf_keys", ["handler"]),
+    -- `name`/`doc` default to spec_keys so method-map leaves like
+    -- `{ get: h, doc: {...} }` stay method maps (they are
+    -- annotations, not subtrees).
+    spec_keys: hash_map.get_or(o, "spec_keys", ["name", "doc"]),
+    methods: hash_map.get_or(o, "methods", STD_METHODS) }
+  entries := rt.route_map(routes, ro)
+  build_doc(entries, o)
+}
+
+--- OpenAPI 3.0.x document for a flat entry list
+--- `[{ path, method | methods, handler?, name?, doc?,
+--- constraints? }]`.
+export openapi_entries := (entries, ...rest) ~> do {
+  o := check_opts(opts_of(rest))
+  if is_arr(entries) == false {
+    error.raise("http-openapi: openapi_entries expects a list " +
+      "of entries")
+  } else {
+    build_doc(entries, o)
+  }
+}

@@ -1,0 +1,259 @@
+--- http-openapi.test -- coverage for the OpenAPI 3.0.x generator
+--- (`src/index.hnl`): pattern bridging (:param, mixed suffix vars,
+--- *splats, (/optional) groups, ?k=v + constraints -> query params),
+--- wildcard methods, doc passthrough, operationId generation +
+--- collision suffixes, expansion cap, opts passthrough, and
+--- openapi()/openapi_entries() parity. JSON round-trip lives in
+--- `json.test.hnl` (interpreted `json.parse` is slow; every case
+--- re-evaluates all top-level bindings, so asserts are consolidated
+--- one-per-fixture to keep the suite tractable).
+
+from "./index" import * as oa
+from "str" import * as str
+
+h := (_req) ~> null
+
+getp := (d, path) ~> hash_map.get_or(d.paths, path, null)
+opp  := (pi, m) ~> hash_map.get_or(pi, m, null)
+gop  := (o, k) ~> hash_map.get_or(o, k, null)
+
+-- ---------------------------------------------------------------------
+-- basics + :param / mixed segments
+-- ---------------------------------------------------------------------
+
+doc0 := oa.openapi_entries([
+  { path: "/health", method: "get", handler: h } ])
+
+doc_param := oa.openapi_entries([
+  { path: "/users/:id", method: "GET", handler: h } ])
+
+doc_mixed := oa.openapi_entries([
+  { path: "/files/:file.:ext", method: "get", handler: h } ])
+
+test_basics := assert doc0.openapi == "3.0.3" &&
+  doc0.info == { title: "API", version: "0.0.0" } &&
+  opp(getp(doc0, "/health"), "get") != null &&
+  gop(opp(getp(doc0, "/health"), "get"), "params") == null &&
+  opp(getp(doc0, "/health"), "GET") == null
+
+test_param := assert getp(doc_param, "/users/{id}") != null &&
+  opp(getp(doc_param, "/users/{id}"), "get") != null &&
+  gop(opp(getp(doc_param, "/users/{id}"), "get"), "params") == [
+    { name: "id", in: "path", required: true,
+      schema: { type: "string" } } ] &&
+  gop(opp(getp(doc_param, "/users/{id}"), "get"),
+    "operationId") == "get_users_id"
+
+test_mixed := assert getp(doc_mixed, "/files/{file}.{ext}") != null &&
+  gop(opp(getp(doc_mixed, "/files/{file}.{ext}"), "get"),
+    "params") == [
+    { name: "file", in: "path", required: true,
+      schema: { type: "string" } },
+    { name: "ext", in: "path", required: true,
+      schema: { type: "string" } } ]
+
+-- ---------------------------------------------------------------------
+-- splats
+-- ---------------------------------------------------------------------
+
+doc_splat := oa.openapi_entries([
+  { path: "/files/*rest", method: "get", handler: h } ])
+
+doc_bare := oa.openapi_entries([
+  { path: "/*", method: "get", handler: h } ])
+
+test_splat := assert getp(doc_splat, "/files/{rest}") != null &&
+  gop(opp(getp(doc_splat, "/files/{rest}"), "get"),
+    "x-handl-pattern") == "/files/*rest" &&
+  gop(opp(getp(doc_splat, "/files/{rest}"), "get"), "params") == [
+    { name: "rest", in: "path", required: true,
+      schema: { type: "string" } } ]
+
+test_bare_splat := assert getp(doc_bare, "/*") != null &&
+  gop(opp(getp(doc_bare, "/*"), "get"), "x-handl-pattern") ==
+    "/*" &&
+  gop(opp(getp(doc_bare, "/*"), "get"), "params") == null
+
+-- ---------------------------------------------------------------------
+-- optional groups: expansion + cap
+-- ---------------------------------------------------------------------
+
+doc_opt := oa.openapi_entries([
+  { path: "/a(/b)", method: "get", handler: h } ])
+
+doc_nested := oa.openapi_entries([
+  { path: "/a(/b(/c))", method: "get", handler: h } ])
+
+doc_many := oa.openapi_entries([
+  { path: "/a(/b)(/c)(/d)(/e)(/f)", method: "get", handler: h } ])
+
+doc_16 := oa.openapi_entries([
+  { path: "/a(/b)(/c)(/d)(/e)", method: "get", handler: h } ])
+
+test_optional := assert getp(doc_opt, "/a/b") != null &&
+  getp(doc_opt, "/a") != null &&
+  gop(opp(getp(doc_opt, "/a/b"), "get"), "operationId") !=
+    gop(opp(getp(doc_opt, "/a"), "get"), "operationId")
+
+test_nested_groups := assert getp(doc_nested, "/a") != null &&
+  getp(doc_nested, "/a/b") != null &&
+  getp(doc_nested, "/a/b/c") != null &&
+  getp(doc_nested, "/a/c") == null
+
+test_expansion_cap := assert getp(doc_many, "/a") != null &&
+  getp(doc_many, "/a/b") == null &&
+  gop(opp(getp(doc_many, "/a"), "get"), "x-handl-pattern") ==
+    "/a(/b)(/c)(/d)(/e)(/f)" &&
+  getp(doc_16, "/a/b/c/d/e") != null
+
+-- ---------------------------------------------------------------------
+-- ?k=v query + entry constraints
+-- ---------------------------------------------------------------------
+
+doc_q := oa.openapi_entries([
+  { path: "/search?q=rust&lang", method: "get", handler: h } ])
+
+doc_cons := oa.openapi_entries([
+  { path: "/items", method: "get", handler: h,
+    constraints: { kind: "book", page: 2 } } ])
+
+doc_cons2 := oa.openapi_entries([
+  { path: "/items", method: "get", handler: h,
+    constraints: [["a", "1"], { k: "b", v: "" }] } ])
+
+test_query_cons := assert gop(opp(getp(doc_q, "/search"), "get"),
+  "params") == [
+    { name: "q", in: "query", required: true,
+      schema: { type: "string", enum: ["rust"] } },
+    { name: "lang", in: "query", required: true,
+      schema: { type: "string" } } ]
+
+test_constraints := assert gop(opp(getp(doc_cons, "/items"),
+  "get"), "params") == [
+    { name: "kind", in: "query", required: true,
+      schema: { type: "string", enum: ["book"] } },
+    { name: "page", in: "query", required: true,
+      schema: { enum: [2] } } ] &&
+  gop(opp(getp(doc_cons2, "/items"), "get"), "params") == [
+    { name: "a", in: "query", required: true,
+      schema: { type: "string", enum: ["1"] } },
+    { name: "b", in: "query", required: true,
+      schema: { type: "string" } } ]
+
+-- ---------------------------------------------------------------------
+-- methods: lists, wildcard, opts.methods expansion
+-- ---------------------------------------------------------------------
+
+doc_mm := oa.openapi_entries([
+  { path: "/multi", methods: ["get", "post"], handler: h } ])
+
+doc_wc := oa.openapi_entries([
+  { path: "/any", method: "*", handler: h } ])
+
+doc_wx := oa.openapi_entries([
+  { path: "/any", method: "*", handler: h } ],
+  { methods: ["get", "post"] })
+
+test_methods := assert opp(getp(doc_mm, "/multi"), "get") != null &&
+  opp(getp(doc_mm, "/multi"), "post") != null &&
+  gop(getp(doc_wc, "/any"), "*") != null &&
+  gop(gop(getp(doc_wc, "/any"), "*"), "x-handl-methods") == ["*"] &&
+  opp(getp(doc_wx, "/any"), "get") != null &&
+  opp(getp(doc_wx, "/any"), "post") != null &&
+  gop(getp(doc_wx, "/any"), "*") == null
+
+-- ---------------------------------------------------------------------
+-- doc passthrough + operationId
+-- ---------------------------------------------------------------------
+
+doc_full := oa.openapi_entries([
+  { path: "/users/:id", method: "delete", handler: h,
+    name: "removeUser",
+    doc: { summary: "Remove a user",
+           description: "Deletes the user record.",
+           tags: ["users", "admin"],
+           deprecated: true,
+           operationId: "users.delete",
+           requestBody: { content: { "application/json":
+             { schema: { type: "object" } } } },
+           responses: { "204": { description: "gone" } },
+           security: [{ bearer: [] }],
+           params: [{ name: "dry", in: "query",
+                      schema: { type: "boolean" } }],
+           bogus_key: "ignored" } } ])
+
+doc_named := oa.openapi_entries([
+  { path: "/ping", method: "get", handler: h, name: "pingOp" } ])
+
+doc_clash := oa.openapi_entries([
+  { path: "/u/:id", method: "get", handler: h,
+    doc: { params: [{ name: "id", in: "path",
+                      description: "doc version",
+                      schema: { type: "integer" } }] } } ])
+
+doc_col := oa.openapi_entries([
+  { path: "/a", method: "get", handler: h },
+  { path: "/b", method: "get", handler: h },
+  { path: "/c", method: "get", handler: h, name: "get_a" } ])
+
+dop := opp(getp(doc_full, "/users/{id}"), "delete")
+
+test_doc_full := assert dop.summary == "Remove a user" &&
+  dop.description == "Deletes the user record." &&
+  dop.tags == ["users", "admin"] &&
+  dop.deprecated == true &&
+  dop.operationId == "users.delete" &&
+  hash_map.get_or(hash_map.get_or(
+    hash_map.get_or(dop, "requestBody", {}), "content", {}),
+    "application/json", null).schema.type == "object" &&
+  hash_map.get_or(dop.responses, "204", null).description ==
+    "gone" &&
+  dop.security == [{ bearer: [] }] &&
+  gop(dop, "bogus_key") == null &&
+  dop.params == [
+    { name: "dry", in: "query", schema: { type: "boolean" } },
+    { name: "id", in: "path", required: true,
+      schema: { type: "string" } } ]
+
+test_name_opid := assert gop(opp(getp(doc_named, "/ping"), "get"),
+  "operationId") == "pingOp"
+
+test_pattern_wins := assert gop(opp(getp(doc_clash, "/u/{id}"),
+  "get"), "params") == [
+    { name: "id", in: "path", required: true,
+      schema: { type: "string" } } ]
+
+test_opid_col := assert getp(doc_col, "/a").get.operationId ==
+  "get_a" && getp(doc_col, "/b").get.operationId == "get_b" &&
+  getp(doc_col, "/c").get.operationId == "get_a_2"
+
+-- ---------------------------------------------------------------------
+-- opts passthrough
+-- ---------------------------------------------------------------------
+
+doc_opts := oa.openapi_entries([
+  { path: "/x", method: "get", handler: h } ],
+  { info: { title: "My API", description: "desc",
+            version: "1.2.3" },
+    servers: [{ url: "https://api.example.com" }],
+    components: { schemas: { Pet: { type: "object" } } } })
+
+test_opts := assert doc_opts.info == { title: "My API",
+  description: "desc", version: "1.2.3" } &&
+  gop(doc_opts, "servers") == [{ url: "https://api.example.com" }] &&
+  gop(gop(doc_opts, "components"), "schemas").Pet.type == "object"
+
+-- ---------------------------------------------------------------------
+-- errors
+-- ---------------------------------------------------------------------
+
+test_errors := assert match error.try(
+    (_x) ~> oa.openapi_entries({ path: "/x" })) {
+  err(_e): true, _: false } &&
+  match error.try(
+    (_x) ~> oa.openapi_entries([{ method: "get" }])) {
+    err(_e): true, _: false } &&
+  match error.try(
+    (_x) ~> oa.openapi_entries([{ path: "/x",
+      constraints: 42 }])) {
+    err(_e): true, _: false }

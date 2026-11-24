@@ -1,0 +1,21 @@
+--- http-openapi json.test -- JSON round-trip coverage, isolated in
+--- its own file: `hnl test` re-evaluates every top-level binding per
+--- case, and the interpreted `json.parse` is slow enough that it
+--- must not tax the main suite's ~60 cases.
+
+from "./index" import * as oa
+from "json" import * as json
+
+h := (_req) ~> null
+
+-- keep the doc minimal: parse cost grows fast with input size.
+jdoc := oa.openapi_entries([
+  { path: "/ping", method: "get", handler: h,
+    doc: { summary: "s" } } ])
+
+jdoc_rt := json.parse(json.stringify(jdoc))
+
+test_json_roundtrip := assert jdoc_rt = jdoc
+
+test_json_keys := assert jdoc_rt.openapi == "3.0.3" &&
+  jdoc_rt.info.title == "API"

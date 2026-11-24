@@ -1,0 +1,71 @@
+--- http-openapi map.test -- openapi/1 route-map coverage, isolated
+--- from index.test.hnl: `route.route_map` flattening is the most
+--- expensive fixture here and every case re-evaluates all top-level
+--- bindings.
+
+from "./index" import * as oa
+
+h := (_req) ~> null
+
+getp := (d, path) ~> hash_map.get_or(d.paths, path, null)
+opp  := (pi, m) ~> hash_map.get_or(pi, m, null)
+gop  := (o, k) ~> hash_map.get_or(o, k, null)
+
+-- ---------------------------------------------------------------------
+-- openapi/1: route maps via route.route_map
+-- ---------------------------------------------------------------------
+
+routes_map := {
+  health: { get: h, post: h },
+  users: {
+    ":id": { get: h, doc: { summary: "show user" } }
+  },
+  ".": h
+}
+
+doc_map := oa.openapi(routes_map)
+
+doc_map2 := oa.openapi({
+  files: {
+    path: "/files/*rest?kind=bin",
+    method: "get",
+    handler: h,
+    doc: { summary: "dl" }
+  }
+})
+
+doc_par_e := oa.openapi_entries([
+  { path: "/health", method: "GET", handler: h },
+  { path: "/health", method: "POST", handler: h },
+  { path: "/users", method: "GET", handler: h },
+  { path: "/", method: "*", handler: h } ])
+
+doc_par_m := oa.openapi({
+  health: { get: h, post: h },
+  users: { get: h },
+  ".": h })
+
+test_route_map := assert opp(getp(doc_map, "/health"), "get") !=
+  null && opp(getp(doc_map, "/health"), "post") != null &&
+  opp(getp(doc_map, "/users/{id}"), "get") != null &&
+  opp(getp(doc_map, "/users/{id}"), "get").summary ==
+    "show user" && getp(doc_map, "/") != null
+
+test_route_map_splat := assert getp(doc_map2,
+  "/files/{rest}") != null &&
+  gop(opp(getp(doc_map2, "/files/{rest}"), "get"),
+    "x-handl-pattern") == "/files/*rest?kind=bin" &&
+  gop(opp(getp(doc_map2, "/files/{rest}"), "get"), "params") == [
+    { name: "rest", in: "path", required: true,
+      schema: { type: "string" } },
+    { name: "kind", in: "query", required: true,
+      schema: { type: "string", enum: ["bin"] } } ]
+
+test_parity := assert opp(getp(doc_par_m, "/health"), "get") !=
+  null && opp(getp(doc_par_m, "/health"), "post") != null &&
+  opp(getp(doc_par_e, "/health"), "get") != null &&
+  opp(getp(doc_par_e, "/health"), "post") != null &&
+  getp(doc_par_m, "/users") != null && getp(doc_par_m, "/") !=
+  null && getp(doc_par_e, "/users") != null &&
+  getp(doc_par_e, "/") != null
+

@@ -1,0 +1,3 @@
+-- lib-http-openapi: modules this package provides (entry defaults to
+-- src/index.hnl; N modules resolve to src/<name>/index.hnl).
+{ modules: ["http-openapi"], deps: { json: "branch:main", route: "branch:main" }, name: "http-openapi", description: "OpenAPI 3.0.x spec generator over lib-route route entries: openapi/1 flattens nested route maps via route.route_map, openapi_entries/1 takes flat {path,method,handler,name?,doc?,constraints?} entries; bridges :param/*splat/(/optional)/?k=v patterns to OpenAPI paths, parameters and vendor extensions.", license: "MIT", keywords: ["openapi", "swagger", "http", "api", "docs", "stdlib", "handl"], homepage: "https://github.com/handl-lang/lib-http-openapi" }
