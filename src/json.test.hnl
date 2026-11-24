@@ -15,7 +15,7 @@ jdoc := oa.openapi_entries([
 
 jdoc_rt := json.parse(json.stringify(jdoc))
 
-test_json_roundtrip := assert jdoc_rt = jdoc
+test_json_roundtrip := assert jdoc_rt == jdoc
 
 test_json_keys := assert jdoc_rt.openapi == "3.0.3" &&
   jdoc_rt.info.title == "API"
